@@ -560,10 +560,7 @@ export default function HomeScreen() {
   );
 
   return (
-    <ScreenContainer
-      containerClassName="bg-[#071A38]"
-      safeAreaClassName="bg-[#F6FAFF]"
-    >
+    <ScreenContainer containerClassName="bg-[#071A38]">
       <StatusBar style="light" />
       <View style={styles.appShell}>
         {view === "scanner"
