@@ -1,9 +1,12 @@
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
+import { CameraView, useCameraPermissions } from "expo-camera";
 import { useRouter } from "expo-router";
-import { useCallback, useMemo, useState } from "react";
+import TextRecognition from "@react-native-ml-kit/text-recognition";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
+  Linking,
   Modal,
   Platform,
   Pressable,
@@ -46,6 +49,7 @@ const PLACEHOLDER_PIN = "XXXX XXXX XXXX XXXX";
 type AppView = "scanner" | "confirm" | "history";
 type ScanState = "ready" | "scanning" | "result";
 type HistoryEntry = { id: string; digits: string; savedAt: number };
+type OcrCandidate = { digits: string; score: number };
 type PinValidation = {
   digits: string;
   isValid: boolean;
@@ -86,7 +90,48 @@ export function validatePin(rawText: string): PinValidation {
         : "",
   };
 }
-
+function extractDigitGroups(rawText: string) {
+  const matches = rawText.match(/\d(?:[\s-]*\d){11,17}/g) ?? [];
+  return matches
+    .filter((match) => {
+      const end = rawText.indexOf(match) + match.length;
+      return !/[\d\s-]*\d/.test(rawText.slice(end, end + 2));
+    })
+    .map(sanitizeDigits)
+    .filter(
+      (digits) =>
+        digits.length >= MIN_PIN_DIGITS && digits.length <= MAX_PIN_DIGITS,
+    );
+}
+export function extractRechargePinCandidates(result: {
+  text: string;
+  blocks?: { text: string; lines?: { text: string }[] }[];
+}): OcrCandidate[] {
+  const structuredEntries = (result.blocks ?? []).flatMap((block) => [
+    { text: block.text },
+    ...(block.lines ?? []).map((line) => ({ text: line.text })),
+  ]);
+  const entries = structuredEntries.length
+    ? structuredEntries
+    : [{ text: result.text }];
+  const byDigits = new Map<string, number>();
+  for (const entry of entries) {
+    const hasPinLabel = /pin|recharge|scratch|code/i.test(entry.text);
+    const isNonPinNumber =
+      /serial|batch|phone|expiry|expires|valid until|price/i.test(entry.text);
+    if (isNonPinNumber && !hasPinLabel) continue;
+    const labelBoost = hasPinLabel ? 100 : 0;
+    for (const digits of extractDigitGroups(entry.text)) {
+      byDigits.set(
+        digits,
+        Math.max(byDigits.get(digits) ?? 0, labelBoost + digits.length),
+      );
+    }
+  }
+  return [...byDigits.entries()]
+    .map(([digits, score]) => ({ digits, score }))
+    .sort((a, b) => b.score - a.score || b.digits.length - a.digits.length);
+}
 function maskPin(digits: string) {
   if (digits.length < 8) return "••••";
   return `${digits.slice(0, 4)} **** ${digits.slice(-4)}`;
@@ -102,9 +147,14 @@ function formatSavedDate(timestamp: number) {
 
 export default function HomeScreen() {
   const router = useRouter();
+  const cameraRef = useRef<CameraView>(null);
+  const [permission, requestPermission] = useCameraPermissions();
   const [view, setView] = useState<AppView>("scanner");
   const [scanState, setScanState] = useState<ScanState>("result");
   const [rawPin, setRawPin] = useState("");
+  const [ocrCandidates, setOcrCandidates] = useState<OcrCandidate[]>([]);
+  const [ocrError, setOcrError] = useState("");
+  const [cameraError, setCameraError] = useState("");
   const [flashOn, setFlashOn] = useState(false);
   const [editVisible, setEditVisible] = useState(false);
   const [editValue, setEditValue] = useState("");
@@ -113,21 +163,60 @@ export default function HomeScreen() {
   const pin = useMemo(() => validatePin(rawPin), [rawPin]);
   const pinGroupCount = pin.digits ? Math.ceil(pin.digits.length / 4) : 0;
 
-  const applyOcrResult = useCallback((rawText: string) => {
-    // A camera/OCR integration can call this with any raw text. Every digit is kept.
-    setRawPin(sanitizeDigits(rawText));
+  useEffect(() => {
+    if (permission && !permission.granted && permission.canAskAgain) {
+      requestPermission();
+    }
+  }, [permission, requestPermission]);
+  const applyOcrCandidates = useCallback((candidates: OcrCandidate[]) => {
+    setOcrCandidates(candidates);
+    setOcrError("");
+    setRawPin(candidates.length === 1 ? candidates[0].digits : "");
     setScanState("result");
   }, []);
-
-  const handleScanAgain = useCallback(() => {
+  const handleScanAgain = useCallback(async () => {
     if (scanState === "scanning") return;
+    if (!permission?.granted) {
+      if (permission?.canAskAgain) {
+        await requestPermission();
+      } else {
+        await Linking.openSettings();
+      }
+      return;
+    }
     setScanState("scanning");
     setRawPin("");
-    // Prototype timing stands in for the camera/OCR callback. A real OCR result
-    // should be passed through applyOcrResult without changing its length.
-    setTimeout(() => applyOcrResult(""), 850);
-  }, [applyOcrResult, scanState]);
-
+    setOcrCandidates([]);
+    setOcrError("");
+    try {
+      const photo = await cameraRef.current?.takePictureAsync({
+        quality: 0.9,
+        skipProcessing: false,
+      });
+      if (!photo?.uri) throw new Error("No photo captured");
+      const result = await TextRecognition.recognize(photo.uri);
+      const candidates = extractRechargePinCandidates(result);
+      if (candidates.length === 0) {
+        setOcrError(
+          "No recharge PIN found. Move closer, reduce glare, and scan again.",
+        );
+        setScanState("result");
+        return;
+      }
+      applyOcrCandidates(candidates);
+    } catch (error) {
+      console.warn("Recharge card OCR failed", error);
+      setOcrError(
+        "Could not read this card. Make sure the PIN is visible and scan again.",
+      );
+      setScanState("result");
+    }
+  }, [applyOcrCandidates, permission, requestPermission, scanState]);
+  const selectOcrCandidate = useCallback((candidate: OcrCandidate) => {
+    setRawPin(candidate.digits);
+    setOcrCandidates([]);
+    setOcrError("");
+  }, []);
   const openEditor = () => {
     setEditValue(pin.digits);
     setEditError("");
@@ -141,6 +230,8 @@ export default function HomeScreen() {
       return;
     }
     setRawPin(digits);
+    setOcrCandidates([]);
+    setOcrError("");
     setScanState("result");
     setEditVisible(false);
     setEditError("");
@@ -232,33 +323,56 @@ export default function HomeScreen() {
             />
           </View>
           <View style={styles.scanFrame}>
-            <View style={[styles.scanCorner, styles.cornerTopLeft]} />
-            <View style={[styles.scanCorner, styles.cornerTopRight]} />
-            <View style={[styles.scanCorner, styles.cornerBottomLeft]} />
-            <View style={[styles.scanCorner, styles.cornerBottomRight]} />
-            <View style={styles.cardMock}>
-              <View style={styles.cardShine} />
-              <View style={styles.cardHeaderLine}>
-                <Text style={styles.cardBrand}>RIGB RECHARGE</Text>
+            {permission?.granted ? (
+              <CameraView
+                ref={cameraRef}
+                facing="back"
+                enableTorch={flashOn}
+                onMountError={(event) => setCameraError(event.message)}
+                style={styles.cameraPreview}
+              />
+            ) : (
+              <View style={styles.cameraPermissionState}>
                 <MaterialCommunityIcons
-                  name="card-outline"
-                  size={18}
-                  color="#7A8796"
+                  name="camera-off-outline"
+                  size={38}
+                  color={COLORS.gold}
                 />
+                <Text style={styles.cameraPermissionTitle}>
+                  Camera permission needed
+                </Text>
+                <Text style={styles.cameraPermissionCopy}>
+                  Allow camera access to scan a recharge card with OCR.
+                </Text>
+                <TouchableOpacity
+                  onPress={() =>
+                    permission?.canAskAgain
+                      ? requestPermission()
+                      : Linking.openSettings()
+                  }
+                  style={styles.permissionButton}
+                >
+                  <Text style={styles.permissionButtonText}>
+                    {permission?.canAskAgain ? "ALLOW CAMERA" : "OPEN SETTINGS"}
+                  </Text>
+                </TouchableOpacity>
               </View>
-              <View style={styles.chip}>
-                <View style={styles.chipLine} />
-                <View style={styles.chipLine} />
-              </View>
-              <Text style={styles.cardLabel}>TOP-UP CARD</Text>
-              <Text style={styles.cardPlaceholder}>PIN AREA</Text>
+            )}
+            <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+              <View style={[styles.scanCorner, styles.cornerTopLeft]} />
+              <View style={[styles.scanCorner, styles.cornerTopRight]} />
+              <View style={[styles.scanCorner, styles.cornerBottomLeft]} />
+              <View style={[styles.scanCorner, styles.cornerBottomRight]} />
             </View>
+            {cameraError ? (
+              <View style={styles.cameraErrorOverlay}>
+                <Text style={styles.cameraErrorText}>{cameraError}</Text>
+              </View>
+            ) : null}
             {scanState === "scanning" && (
               <View style={styles.scanningOverlay}>
                 <ActivityIndicator size="small" color={COLORS.gold} />
-                <Text style={styles.scanningText}>
-                  Looking for card digits…
-                </Text>
+                <Text style={styles.scanningText}>Reading card with OCR…</Text>
               </View>
             )}
           </View>
@@ -282,6 +396,25 @@ export default function HomeScreen() {
               />
             </TouchableOpacity>
           </View>
+          {ocrCandidates.length > 1 ? (
+            <View style={styles.candidatePanel}>
+              <Text style={styles.candidateTitle}>
+                Multiple PIN-looking groups found — choose the recharge PIN
+              </Text>
+              {ocrCandidates.map((candidate, index) => (
+                <TouchableOpacity
+                  key={candidate.digits}
+                  onPress={() => selectOcrCandidate(candidate)}
+                  style={styles.candidateButton}
+                >
+                  <Text style={styles.candidateLabel}>OPTION {index + 1}</Text>
+                  <Text style={styles.candidateDigits}>
+                    {formatPin(candidate.digits)}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          ) : null}
           <Text
             selectable
             style={[
@@ -296,7 +429,12 @@ export default function HomeScreen() {
             {pin.digits.length} {pin.digits.length === 1 ? "digit" : "digits"}{" "}
             detected
           </Text>
-          {pin.error ? (
+          {ocrError ? (
+            <View style={styles.messageBoxDanger}>
+              <Ionicons name="alert-circle" size={17} color={COLORS.danger} />
+              <Text style={styles.messageDanger}>{ocrError}</Text>
+            </View>
+          ) : pin.error ? (
             <View style={styles.messageBoxDanger}>
               <Ionicons name="alert-circle" size={17} color={COLORS.danger} />
               <Text style={styles.messageDanger}>{pin.error}</Text>
@@ -745,6 +883,50 @@ const styles = StyleSheet.create({
     overflow: "hidden",
     position: "relative",
   },
+  cameraPreview: StyleSheet.absoluteFill,
+  cameraPermissionState: {
+    alignItems: "center",
+    backgroundColor: "#12335F",
+    flex: 1,
+    justifyContent: "center",
+    paddingHorizontal: 24,
+  },
+  cameraPermissionTitle: {
+    color: COLORS.white,
+    fontSize: 16,
+    fontWeight: "800",
+    marginTop: 12,
+    textAlign: "center",
+  },
+  cameraPermissionCopy: {
+    color: "#C4D8F1",
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 6,
+    textAlign: "center",
+  },
+  permissionButton: {
+    backgroundColor: COLORS.gold,
+    borderRadius: 10,
+    marginTop: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  permissionButtonText: {
+    color: COLORS.navy,
+    fontSize: 11,
+    fontWeight: "900",
+    letterSpacing: 0.6,
+  },
+  cameraErrorOverlay: {
+    backgroundColor: "rgba(197,61,80,0.9)",
+    left: 12,
+    padding: 9,
+    position: "absolute",
+    right: 12,
+    top: 12,
+  },
+  cameraErrorText: { color: COLORS.white, fontSize: 11, textAlign: "center" },
   scanCorner: {
     borderColor: COLORS.gold,
     height: 30,
@@ -769,71 +951,6 @@ const styles = StyleSheet.create({
     borderRightWidth: 3,
     bottom: 16,
     right: 16,
-  },
-  cardMock: {
-    backgroundColor: "#D9DEE4",
-    borderColor: "#F6F8FA",
-    borderRadius: 13,
-    elevation: 2,
-    height: 130,
-    overflow: "hidden",
-    padding: 15,
-    shadowColor: "#000",
-    shadowOffset: { height: 5, width: 0 },
-    shadowOpacity: 0.22,
-    shadowRadius: 9,
-    width: "78%",
-  },
-  cardShine: {
-    backgroundColor: "rgba(255,255,255,0.36)",
-    height: 250,
-    position: "absolute",
-    right: -70,
-    transform: [{ rotate: "28deg" }],
-    width: 75,
-  },
-  cardHeaderLine: {
-    alignItems: "center",
-    flexDirection: "row",
-    justifyContent: "space-between",
-  },
-  cardBrand: {
-    color: "#586A80",
-    fontSize: 12,
-    fontWeight: "900",
-    letterSpacing: 0.6,
-  },
-  chip: {
-    backgroundColor: "#C8A965",
-    borderRadius: 5,
-    height: 28,
-    justifyContent: "center",
-    marginTop: 16,
-    paddingHorizontal: 5,
-    width: 36,
-  },
-  chipLine: {
-    borderColor: "#937844",
-    borderTopWidth: 1,
-    marginVertical: 2,
-    width: 26,
-  },
-  cardLabel: {
-    bottom: 14,
-    color: "#617287",
-    fontSize: 10,
-    fontWeight: "800",
-    left: 15,
-    letterSpacing: 1.3,
-    position: "absolute",
-  },
-  cardPlaceholder: {
-    bottom: 14,
-    color: "#8C9AA9",
-    fontSize: 10,
-    fontWeight: "700",
-    position: "absolute",
-    right: 15,
   },
   scanningOverlay: {
     alignItems: "center",
@@ -867,6 +984,43 @@ const styles = StyleSheet.create({
     alignItems: "flex-start",
     flexDirection: "row",
     justifyContent: "space-between",
+  },
+  candidatePanel: {
+    backgroundColor: COLORS.goldSoft,
+    borderColor: COLORS.gold,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginTop: 12,
+    padding: 10,
+  },
+  candidateTitle: {
+    color: COLORS.warning,
+    fontSize: 12,
+    fontWeight: "800",
+    lineHeight: 17,
+    marginBottom: 8,
+  },
+  candidateButton: {
+    backgroundColor: COLORS.white,
+    borderColor: COLORS.blueLine,
+    borderRadius: 9,
+    borderWidth: 1,
+    marginTop: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  candidateLabel: {
+    color: COLORS.blue,
+    fontSize: 9,
+    fontWeight: "900",
+    letterSpacing: 0.8,
+  },
+  candidateDigits: {
+    color: COLORS.ink,
+    fontSize: 17,
+    fontWeight: "900",
+    letterSpacing: 0.4,
+    marginTop: 3,
   },
   eyebrow: {
     color: COLORS.blue,

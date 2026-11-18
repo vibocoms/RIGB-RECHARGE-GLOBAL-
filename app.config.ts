@@ -108,6 +108,13 @@ const config: ExpoConfig = {
     "expo-asset",
     "expo-router",
     [
+      "expo-camera",
+      {
+        cameraPermission:
+          "Allow RIGB Recharge Global to use the camera to scan recharge PINs.",
+      },
+    ],
+    [
       "expo-audio",
       {
         microphonePermission:

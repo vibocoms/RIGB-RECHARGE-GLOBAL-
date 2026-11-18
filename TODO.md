@@ -2,8 +2,15 @@
 
 - [x] **Reference-aligned blue recharge scanner:** Deliver a portrait-first RIGB RECHARGE GLOBAL screen with a top app bar, back navigation, wordmark, scan guidance, camera/card alignment area, flashlight controls, prominent Scan Again action, and secure Nigeria footer treatment.
   - The app uses the user-selected blue-first visual direction with gold accents and retains the reference composition without copying numeric PIN data from the image.
+  - The scan area uses a real Expo Camera live preview, not a static card image.
+  - Camera permission is requested on open; denied permission shows `Camera permission needed` and an `OPEN SETTINGS` action.
   - The card artwork and all empty states use placeholder-only PIN content such as `XXXX XXXX XXXX XXXX`.
-  - Scan Again has a visible scanning state and returns to a completed result state without inventing or truncating a PIN.
+  - Scan Again captures a real camera photo, runs on-device ML Kit OCR, and returns a result without inventing or truncating a PIN.
+
+- [x] **Recharge PIN-only OCR selection:** Extract only likely recharge PIN groups from the OCR result.
+  - Prefer blocks labeled PIN, Recharge PIN, Recharge Code, Code, or Scratch.
+  - Accept only 12–18 digit candidates after removing spaces, dashes, and letters.
+  - Ignore shorter serial/batch/phone/price/expiry numbers; when multiple valid candidates are found, show all options in PIN RESULT and require a tap to choose.
 
 - [x] **Dynamic OCR PIN normalization and display:** Make the PIN result panel display the complete digit string returned by OCR or edit input.
   - Remove spaces, dashes, and letters before display.
