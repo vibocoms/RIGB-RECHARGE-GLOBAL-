@@ -2,14 +2,17 @@ import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { useRouter } from "expo-router";
 import TextRecognition from "@react-native-ml-kit/text-recognition";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
   Linking,
   Modal,
+  NativeModules,
   Platform,
   Pressable,
+  PermissionsAndroid,
   ScrollView,
   StyleSheet,
   Text,
@@ -46,16 +49,46 @@ const MIN_PIN_DIGITS = 12;
 const MAX_PIN_DIGITS = 18;
 const PLACEHOLDER_PIN = "XXXX XXXX XXXX XXXX";
 
-type AppView = "scanner" | "confirm" | "history";
+type AppView = "scanner" | "confirm" | "history" | "settings";
 type ScanState = "ready" | "scanning" | "result";
 type HistoryEntry = { id: string; digits: string; savedAt: number };
 type OcrCandidate = { digits: string; score: number };
+type NetworkName = "MTN" | "Airtel" | "Glo" | "9mobile";
+type UssdEntry = { code: string; last_updated: string };
+type UssdConfig = Record<NetworkName, UssdEntry>;
+type SimCard = {
+  carrierName: string;
+  number: string;
+  subscriptionId: number;
+  slotIndex: number;
+};
+type SmartDialog = {
+  kind: "stale" | "failed";
+  network: NetworkName;
+  sim: SimCard;
+};
+type TelecomApi = {
+  getSimCards?: () => Promise<SimCard[]>;
+  dialUssd?: (ussd: string, subscriptionId: number) => Promise<boolean>;
+};
 type PinValidation = {
   digits: string;
   isValid: boolean;
   error: string;
   warning: string;
 };
+const NETWORKS: NetworkName[] = ["MTN", "Airtel", "Glo", "9mobile"];
+const FALLBACK_USSD = "*311*{PIN}#";
+const USSD_REMOTE_URL =
+  "https://raw.githubusercontent.com/vibocoms/RIGB-RECHARGE-GLOBAL-/main/ussd-codes.json";
+const USSD_STORAGE_PREFIX = "rigb.ussd.";
+const INITIAL_USSD_CONFIG: UssdConfig = {
+  MTN: { code: FALLBACK_USSD, last_updated: "never" },
+  Airtel: { code: FALLBACK_USSD, last_updated: "never" },
+  Glo: { code: FALLBACK_USSD, last_updated: "never" },
+  "9mobile": { code: FALLBACK_USSD, last_updated: "never" },
+};
+const telecomApi = NativeModules.RigbTelecom as TelecomApi | undefined;
 
 /** Keeps the complete numeric payload returned by OCR or entered by the user. */
 export function sanitizeDigits(rawText: string) {
@@ -144,7 +177,54 @@ function formatSavedDate(timestamp: number) {
     year: "numeric",
   }).format(new Date(timestamp));
 }
-
+function resolveNetwork(carrierName: string): NetworkName {
+  const carrier = carrierName.toLowerCase();
+  if (carrier.includes("airtel")) return "Airtel";
+  if (carrier.includes("glo")) return "Glo";
+  if (carrier.includes("9mobile") || carrier.includes("etisalat")) {
+    return "9mobile";
+  }
+  return "MTN";
+}
+function isUssdEntry(value: unknown): value is UssdEntry {
+  if (!value || typeof value !== "object") return false;
+  const entry = value as Partial<UssdEntry>;
+  return (
+    typeof entry.code === "string" &&
+    entry.code.includes("{PIN}") &&
+    typeof entry.last_updated === "string"
+  );
+}
+function parseRemoteUssdConfig(value: unknown): Partial<UssdConfig> {
+  if (!value || typeof value !== "object") return {};
+  const source = value as Record<string, unknown>;
+  return NETWORKS.reduce<Partial<UssdConfig>>((config, network) => {
+    if (isUssdEntry(source[network])) config[network] = source[network];
+    return config;
+  }, {});
+}
+function isUssdStale(entry: UssdEntry) {
+  if (entry.last_updated === "never") return true;
+  const updated = Date.parse(`${entry.last_updated}T00:00:00Z`);
+  return (
+    !Number.isFinite(updated) || Date.now() - updated > 7 * 24 * 60 * 60 * 1000
+  );
+}
+function buildUssd(code: string, digits: string) {
+  return code.replace("{PIN}", digits);
+}
+async function fetchWithTimeout(url: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6500);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok)
+      throw new Error(`Remote config returned ${response.status}`);
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 export default function HomeScreen() {
   const router = useRouter();
   const cameraRef = useRef<CameraView>(null);
@@ -160,6 +240,16 @@ export default function HomeScreen() {
   const [editValue, setEditValue] = useState("");
   const [editError, setEditError] = useState("");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [ussdConfig, setUssdConfig] = useState<UssdConfig>(INITIAL_USSD_CONFIG);
+  const [ussdStatus, setUssdStatus] = useState("");
+  const [simPickerVisible, setSimPickerVisible] = useState(false);
+  const [simCards, setSimCards] = useState<SimCard[]>([]);
+  const [smartDialog, setSmartDialog] = useState<SmartDialog | null>(null);
+  const [ussdEditNetwork, setUssdEditNetwork] = useState<NetworkName | null>(
+    null,
+  );
+  const [ussdEditValue, setUssdEditValue] = useState("");
+  const [ussdEditError, setUssdEditError] = useState("");
   const pin = useMemo(() => validatePin(rawPin), [rawPin]);
   const pinGroupCount = pin.digits ? Math.ceil(pin.digits.length / 4) : 0;
 
@@ -217,6 +307,194 @@ export default function HomeScreen() {
     setOcrCandidates([]);
     setOcrError("");
   }, []);
+  const saveUssdEntry = useCallback(
+    async (network: NetworkName, entry: UssdEntry) => {
+      setUssdConfig((current) => ({ ...current, [network]: entry }));
+      await AsyncStorage.setItem(
+        `${USSD_STORAGE_PREFIX}${network}`,
+        JSON.stringify(entry),
+      );
+    },
+    [],
+  );
+  const refreshNetwork = useCallback(
+    async (network: NetworkName) => {
+      const remote = parseRemoteUssdConfig(
+        await fetchWithTimeout(USSD_REMOTE_URL),
+      );
+      const entry = remote[network];
+      if (!entry) throw new Error(`No ${network} code in remote config`);
+      await saveUssdEntry(network, entry);
+      return entry;
+    },
+    [saveUssdEntry],
+  );
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      const stored = await AsyncStorage.multiGet(
+        NETWORKS.map((network) => `${USSD_STORAGE_PREFIX}${network}`),
+      );
+      const fromStorage = { ...INITIAL_USSD_CONFIG };
+      stored.forEach(([key, value]) => {
+        if (!value) return;
+        const network = key.replace(USSD_STORAGE_PREFIX, "") as NetworkName;
+        try {
+          const parsed: unknown = JSON.parse(value);
+          if (isUssdEntry(parsed) && NETWORKS.includes(network)) {
+            fromStorage[network] = parsed;
+          }
+        } catch {
+          // Ignore malformed local data and keep the safe fallback.
+        }
+      });
+      if (active) setUssdConfig(fromStorage);
+      try {
+        const remote = parseRemoteUssdConfig(
+          await fetchWithTimeout(USSD_REMOTE_URL),
+        );
+        for (const network of NETWORKS) {
+          if (remote[network]) await saveUssdEntry(network, remote[network]);
+        }
+      } catch {
+        // Offline startup intentionally keeps each network's own local value.
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [saveUssdEntry]);
+  const recordDialHistory = useCallback((digits: string) => {
+    setHistory((current) => [
+      { id: `${Date.now()}-${digits}`, digits, savedAt: Date.now() },
+      ...current,
+    ]);
+  }, []);
+  const dialWithSim = useCallback(
+    async (sim: SimCard, entry: UssdEntry, network: NetworkName) => {
+      if (Platform.OS !== "android" || !telecomApi?.dialUssd) {
+        setUssdStatus("Automatic SIM dialing is available on Android only.");
+        return;
+      }
+      const permissions = await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.CALL_PHONE,
+        PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE,
+      ]);
+      const allowed =
+        permissions[PermissionsAndroid.PERMISSIONS.CALL_PHONE] ===
+          PermissionsAndroid.RESULTS.GRANTED &&
+        permissions[PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE] ===
+          PermissionsAndroid.RESULTS.GRANTED;
+      if (!allowed) {
+        setUssdStatus(
+          "CALL_PHONE and READ_PHONE_STATE permissions are required to dial.",
+        );
+        return;
+      }
+      const ussd = buildUssd(entry.code, pin.digits);
+      try {
+        await telecomApi.dialUssd(ussd, sim.subscriptionId);
+        recordDialHistory(pin.digits);
+        setUssdStatus(
+          `${network} recharge code sent through ${sim.carrierName}.`,
+        );
+      } catch {
+        setUssdStatus("Could not start the call through the selected SIM.");
+      }
+    },
+    [pin.digits, recordDialHistory],
+  );
+  const processDialForSim = useCallback(
+    async (sim: SimCard) => {
+      const network = resolveNetwork(sim.carrierName);
+      const cached = ussdConfig[network];
+      try {
+        const latest = await refreshNetwork(network);
+        await dialWithSim(sim, latest, network);
+      } catch {
+        if (isUssdStale(cached)) {
+          setSmartDialog({ kind: "stale", network, sim });
+          return;
+        }
+        await dialWithSim(sim, cached, network);
+      }
+    },
+    [dialWithSim, refreshNetwork, ussdConfig],
+  );
+  const handleDialPress = useCallback(async () => {
+    if (!pin.isValid) return;
+    setUssdStatus("");
+    if (Platform.OS !== "android" || !telecomApi?.getSimCards) {
+      setUssdStatus("SIM dialing is available in the signed Android app.");
+      return;
+    }
+    try {
+      const cards = (await telecomApi.getSimCards()).slice(0, 3);
+      if (cards.length === 0) {
+        setUssdStatus("No active SIM card was found.");
+      } else if (cards.length === 1) {
+        await processDialForSim(cards[0]);
+      } else {
+        setSimCards(cards);
+        setSimPickerVisible(true);
+      }
+    } catch {
+      setUssdStatus(
+        "Allow phone permissions so the app can identify the active SIM.",
+      );
+    }
+  }, [pin.isValid, processDialForSim]);
+  const chooseSim = async (sim: SimCard) => {
+    setSimPickerVisible(false);
+    await processDialForSim(sim);
+  };
+  const connectAndUpdate = async () => {
+    if (!smartDialog) return;
+    const { network, sim } = smartDialog;
+    setSmartDialog(null);
+    try {
+      const latest = await refreshNetwork(network);
+      setUssdStatus(`${network} Code Updated`);
+      await dialWithSim(sim, latest, network);
+    } catch {
+      setSmartDialog({ kind: "failed", network, sim });
+    }
+  };
+  const dialOfflineAnyway = async () => {
+    if (!smartDialog) return;
+    const { network, sim } = smartDialog;
+    setSmartDialog(null);
+    await dialWithSim(sim, ussdConfig[network], network);
+  };
+  const checkForUpdate = async (network: NetworkName) => {
+    setUssdStatus(`Checking ${network} code…`);
+    try {
+      await refreshNetwork(network);
+      setUssdStatus(`${network} Code Updated`);
+    } catch {
+      setUssdStatus(`Could not update ${network}. Check your connection.`);
+    }
+  };
+  const openUssdEditor = (network: NetworkName) => {
+    setUssdEditNetwork(network);
+    setUssdEditValue(ussdConfig[network].code);
+    setUssdEditError("");
+  };
+  const saveManualUssd = async () => {
+    if (!ussdEditNetwork) return;
+    if (!ussdEditValue.includes("{PIN}")) {
+      setUssdEditError(
+        "Code must include {PIN} exactly where the recharge PIN goes.",
+      );
+      return;
+    }
+    await saveUssdEntry(ussdEditNetwork, {
+      code: ussdEditValue.trim(),
+      last_updated: new Date().toISOString().slice(0, 10),
+    });
+    setUssdEditNetwork(null);
+    setUssdStatus(`${ussdEditNetwork} code saved locally.`);
+  };
   const openEditor = () => {
     setEditValue(pin.digits);
     setEditError("");
@@ -271,11 +549,11 @@ export default function HomeScreen() {
         {title}
       </Text>
       <TouchableOpacity
-        accessibilityLabel="Open history"
-        onPress={() => setView("history")}
+        accessibilityLabel="Open USSD code settings"
+        onPress={() => setView("settings")}
         style={styles.headerIcon}
       >
-        <MaterialCommunityIcons name="history" size={24} color={COLORS.white} />
+        <Ionicons name="settings-outline" size={24} color={COLORS.white} />
       </TouchableOpacity>
     </View>
   );
@@ -464,6 +742,31 @@ export default function HomeScreen() {
           )}
         </View>
 
+        <TouchableOpacity
+          accessibilityLabel="Dial to recharge"
+          disabled={!pin.isValid}
+          onPress={handleDialPress}
+          style={[styles.dialButton, !pin.isValid && styles.dialButtonDisabled]}
+        >
+          <MaterialCommunityIcons
+            name="phone-outgoing"
+            size={24}
+            color={pin.isValid ? COLORS.navy : COLORS.muted}
+          />
+          <Text style={styles.dialButtonText}>
+            {pin.isValid ? "DIAL TO RECHARGE" : "ENTER 12–18 DIGITS TO DIAL"}
+          </Text>
+        </TouchableOpacity>
+        {ussdStatus ? (
+          <View style={styles.ussdStatusBox}>
+            <Ionicons
+              name="information-circle-outline"
+              size={17}
+              color={COLORS.blue}
+            />
+            <Text style={styles.ussdStatusText}>{ussdStatus}</Text>
+          </View>
+        ) : null}
         <View style={styles.controlRow}>
           <TouchableOpacity
             accessibilityLabel={
@@ -697,6 +1000,79 @@ export default function HomeScreen() {
     </>
   );
 
+  const renderSettings = () => (
+    <>
+      {renderHeader("USSD CODES")}
+      <ScrollView
+        contentContainerStyle={styles.detailScroll}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.detailIconCircle}>
+          <MaterialCommunityIcons
+            name="cellphone-cog"
+            size={31}
+            color={COLORS.blue}
+          />
+        </View>
+        <Text style={styles.detailEyebrow}>NETWORK SETTINGS</Text>
+        <Text style={styles.detailTitle}>USSD Codes</Text>
+        <Text style={styles.detailCopy}>
+          Online config is the truth. Each network keeps its own offline code.
+        </Text>
+        {ussdStatus ? (
+          <View style={styles.ussdStatusBox}>
+            <Ionicons
+              name="information-circle-outline"
+              size={17}
+              color={COLORS.blue}
+            />
+            <Text style={styles.ussdStatusText}>{ussdStatus}</Text>
+          </View>
+        ) : null}
+        {NETWORKS.map((network) => (
+          <View key={network} style={styles.ussdCard}>
+            <View style={styles.ussdCardHeader}>
+              <Text style={styles.ussdNetwork}>{network}</Text>
+              <Text style={styles.ussdUpdated}>
+                Last updated: {ussdConfig[network].last_updated}
+              </Text>
+            </View>
+            <Text selectable style={styles.ussdCode}>
+              {ussdConfig[network].code}
+            </Text>
+            <View style={styles.ussdActions}>
+              <TouchableOpacity
+                onPress={() => checkForUpdate(network)}
+                style={styles.ussdActionButton}
+              >
+                <Ionicons name="refresh" size={16} color={COLORS.blue} />
+                <Text style={styles.ussdActionText}>CHECK FOR UPDATE</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => openUssdEditor(network)}
+                style={styles.ussdActionButton}
+              >
+                <MaterialCommunityIcons
+                  name="pencil-outline"
+                  size={16}
+                  color={COLORS.blue}
+                />
+                <Text style={styles.ussdActionText}>EDIT MANUALLY</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        ))}
+        <TouchableOpacity
+          onPress={() => setView("scanner")}
+          style={styles.primaryButton}
+        >
+          <Ionicons name="arrow-back" size={20} color={COLORS.white} />
+          <Text style={styles.primaryButtonText}>BACK TO SCANNER</Text>
+        </TouchableOpacity>
+      </ScrollView>
+    </>
+  );
+
   return (
     <ScreenContainer containerClassName="bg-[#071A38]">
       <StatusBar style="light" />
@@ -705,8 +1081,177 @@ export default function HomeScreen() {
           ? renderScanner()
           : view === "confirm"
             ? renderConfirm()
-            : renderHistory()}
+            : view === "history"
+              ? renderHistory()
+              : renderSettings()}
       </View>
+      <Modal
+        animationType="fade"
+        transparent
+        visible={simPickerVisible}
+        onRequestClose={() => setSimPickerVisible(false)}
+      >
+        <View style={styles.dialogBackdrop}>
+          <View style={styles.dialogCard}>
+            <Text style={styles.dialogEyebrow}>SELECT SIM</Text>
+            <Text style={styles.dialogTitle}>Which SIM should dial?</Text>
+            <Text style={styles.dialogCopy}>
+              The selected SIM’s carrier code and saved network settings will be
+              used.
+            </Text>
+            {simCards.map((sim) => (
+              <TouchableOpacity
+                key={sim.subscriptionId}
+                onPress={() => chooseSim(sim)}
+                style={styles.simOption}
+              >
+                <View style={styles.simOptionIcon}>
+                  <MaterialCommunityIcons
+                    name="sim"
+                    size={21}
+                    color={COLORS.blue}
+                  />
+                </View>
+                <View style={styles.simOptionBody}>
+                  <Text style={styles.simOptionTitle}>
+                    SIM {sim.slotIndex + 1} · {sim.carrierName}
+                  </Text>
+                  <Text style={styles.simOptionNumber}>
+                    {sim.number || "Number hidden by carrier"}
+                  </Text>
+                </View>
+                <Ionicons
+                  name="chevron-forward"
+                  size={19}
+                  color={COLORS.muted}
+                />
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity
+              onPress={() => setSimPickerVisible(false)}
+              style={styles.secondaryButton}
+            >
+              <Text style={styles.secondaryButtonText}>CANCEL</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        animationType="fade"
+        transparent
+        visible={smartDialog !== null}
+        onRequestClose={() => setSmartDialog(null)}
+      >
+        <View style={styles.dialogBackdrop}>
+          <View style={styles.dialogCard}>
+            <Text style={styles.dialogEyebrow}>
+              {smartDialog?.kind === "failed"
+                ? "UPDATE FAILED"
+                : "OFFLINE CHECK"}
+            </Text>
+            <Text style={styles.dialogTitle}>
+              {smartDialog?.kind === "failed"
+                ? "Still offline. Dial with old code?"
+                : `${smartDialog?.network} dialing code may be outdated.`}
+            </Text>
+            <Text style={styles.dialogCopy}>
+              {smartDialog?.kind === "failed"
+                ? "The latest code could not be fetched for this network."
+                : `Please turn on Mobile Data or WiFi to check for latest ${smartDialog?.network} code.`}
+            </Text>
+            <TouchableOpacity
+              onPress={
+                smartDialog?.kind === "failed"
+                  ? dialOfflineAnyway
+                  : connectAndUpdate
+              }
+              style={styles.primaryButton}
+            >
+              <Text style={styles.primaryButtonText}>
+                {smartDialog?.kind === "failed"
+                  ? "YES DIAL"
+                  : "CONNECT & UPDATE"}
+              </Text>
+            </TouchableOpacity>
+            {smartDialog?.kind !== "failed" ? (
+              <TouchableOpacity
+                onPress={dialOfflineAnyway}
+                style={styles.secondaryButton}
+              >
+                <Text style={styles.secondaryButtonText}>
+                  DIAL ANYWAY OFFLINE
+                </Text>
+              </TouchableOpacity>
+            ) : null}
+            <TouchableOpacity
+              onPress={() => setSmartDialog(null)}
+              style={styles.dialogCancelButton}
+            >
+              <Text style={styles.dialogCancelText}>CANCEL</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        animationType="slide"
+        transparent
+        visible={ussdEditNetwork !== null}
+        onRequestClose={() => setUssdEditNetwork(null)}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          style={styles.modalRoot}
+        >
+          <Pressable
+            onPress={() => setUssdEditNetwork(null)}
+            style={styles.modalBackdrop}
+          />
+          <View style={styles.editSheet}>
+            <View style={styles.sheetHandle} />
+            <View style={styles.sheetHeader}>
+              <View>
+                <Text style={styles.detailEyebrow}>EDIT USSD CODE</Text>
+                <Text style={styles.sheetTitle}>{ussdEditNetwork}</Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => setUssdEditNetwork(null)}
+                style={styles.closeButton}
+              >
+                <Ionicons name="close" size={24} color={COLORS.ink} />
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.sheetCopy}>
+              Save offline for this network. Keep {"{PIN}"} where the recharge
+              PIN belongs.
+            </Text>
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={(value) => {
+                setUssdEditValue(value);
+                setUssdEditError("");
+              }}
+              placeholder="*311*{PIN}#"
+              placeholderTextColor="#92A3B8"
+              style={styles.pinInput}
+              value={ussdEditValue}
+            />
+            {ussdEditError ? (
+              <View style={styles.messageBoxDanger}>
+                <Ionicons name="alert-circle" size={17} color={COLORS.danger} />
+                <Text style={styles.messageDanger}>{ussdEditError}</Text>
+              </View>
+            ) : null}
+            <TouchableOpacity
+              onPress={saveManualUssd}
+              style={styles.primaryButton}
+            >
+              <Text style={styles.primaryButtonText}>SAVE CODE OFFLINE</Text>
+              <Ionicons name="checkmark" size={19} color={COLORS.white} />
+            </TouchableOpacity>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
       <Modal
         animationType="slide"
         transparent
@@ -1107,6 +1652,40 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     lineHeight: 17,
   },
+  dialButton: {
+    alignItems: "center",
+    backgroundColor: COLORS.gold,
+    borderRadius: 18,
+    flexDirection: "row",
+    gap: 9,
+    justifyContent: "center",
+    marginTop: 14,
+    minHeight: 60,
+    paddingHorizontal: 14,
+  },
+  dialButtonDisabled: { backgroundColor: "#E7EDF5" },
+  dialButtonText: {
+    color: COLORS.navy,
+    fontSize: 18,
+    fontWeight: "900",
+    letterSpacing: 0.5,
+  },
+  ussdStatusBox: {
+    alignItems: "flex-start",
+    backgroundColor: COLORS.blueWash,
+    borderRadius: 11,
+    flexDirection: "row",
+    gap: 7,
+    marginTop: 12,
+    padding: 10,
+  },
+  ussdStatusText: {
+    color: COLORS.blue,
+    flex: 1,
+    fontSize: 12,
+    fontWeight: "700",
+    lineHeight: 17,
+  },
   controlRow: { flexDirection: "row", gap: 11, marginTop: 13 },
   controlButton: {
     alignItems: "center",
@@ -1242,6 +1821,102 @@ const styles = StyleSheet.create({
     marginTop: 9,
     textAlign: "center",
   },
+  ussdCard: {
+    backgroundColor: COLORS.white,
+    borderColor: COLORS.blueLine,
+    borderRadius: 17,
+    borderWidth: 1.5,
+    marginTop: 14,
+    padding: 14,
+  },
+  ussdCardHeader: {
+    alignItems: "center",
+    flexDirection: "row",
+    justifyContent: "space-between",
+  },
+  ussdNetwork: { color: COLORS.ink, fontSize: 17, fontWeight: "900" },
+  ussdUpdated: { color: COLORS.muted, fontSize: 10, fontWeight: "700" },
+  ussdCode: {
+    color: COLORS.navy,
+    fontSize: 20,
+    fontWeight: "900",
+    letterSpacing: 0.5,
+    marginTop: 13,
+  },
+  ussdActions: { flexDirection: "row", gap: 8, marginTop: 14 },
+  ussdActionButton: {
+    alignItems: "center",
+    borderColor: COLORS.blueLine,
+    borderRadius: 9,
+    borderWidth: 1,
+    flex: 1,
+    flexDirection: "row",
+    gap: 5,
+    justifyContent: "center",
+    minHeight: 38,
+    paddingHorizontal: 5,
+  },
+  ussdActionText: {
+    color: COLORS.blue,
+    fontSize: 9,
+    fontWeight: "900",
+    letterSpacing: 0.2,
+  },
+  dialogBackdrop: {
+    alignItems: "center",
+    backgroundColor: "rgba(7,26,56,0.68)",
+    flex: 1,
+    justifyContent: "center",
+    padding: 20,
+  },
+  dialogCard: {
+    backgroundColor: COLORS.paper,
+    borderRadius: 22,
+    padding: 20,
+    width: "100%",
+  },
+  dialogEyebrow: {
+    color: COLORS.blue,
+    fontSize: 11,
+    fontWeight: "900",
+    letterSpacing: 1.3,
+  },
+  dialogTitle: {
+    color: COLORS.ink,
+    fontSize: 22,
+    fontWeight: "900",
+    lineHeight: 28,
+    marginTop: 7,
+  },
+  dialogCopy: {
+    color: COLORS.muted,
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 8,
+  },
+  simOption: {
+    alignItems: "center",
+    backgroundColor: COLORS.white,
+    borderColor: COLORS.blueLine,
+    borderRadius: 13,
+    borderWidth: 1,
+    flexDirection: "row",
+    marginTop: 11,
+    padding: 11,
+  },
+  simOptionIcon: {
+    alignItems: "center",
+    backgroundColor: COLORS.blueWash,
+    borderRadius: 20,
+    height: 40,
+    justifyContent: "center",
+    width: 40,
+  },
+  simOptionBody: { flex: 1, marginLeft: 10 },
+  simOptionTitle: { color: COLORS.ink, fontSize: 14, fontWeight: "900" },
+  simOptionNumber: { color: COLORS.muted, fontSize: 11, marginTop: 3 },
+  dialogCancelButton: { alignItems: "center", marginTop: 14, padding: 6 },
+  dialogCancelText: { color: COLORS.muted, fontSize: 12, fontWeight: "900" },
   confirmCard: {
     backgroundColor: COLORS.white,
     borderColor: COLORS.blueLine,

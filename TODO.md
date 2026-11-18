@@ -31,4 +31,17 @@
   - Display history as first four digits + `****` + last four digits and show the saved digit count.
   - Never display the full saved PIN in History.
 
+- [x] **Per-network USSD configuration and offline fallback:** Store MTN, Airtel, Glo, and 9mobile codes separately with each network’s own `last_updated` date.
+  - Fetch the online JSON at app start when available, save each network independently to local storage, and use that network’s saved value while offline.
+  - If a network has never been fetched and the device is offline, use the fallback `*311*{PIN}#` only for that network.
+  - Before dialing, check only the selected SIM’s network; if offline and its code is more than 7 days old, show the network-specific outdated-code prompt with `Connect & Update` and `Dial Anyway Offline`.
+  - Connect & Update fetches only the selected network’s value, saves it, shows `{NETWORK} Code Updated`, and auto-dials; failed updates offer `Yes Dial` or `Cancel`.
+
+- [x] **USSD Codes settings:** Add Settings > USSD Codes with all four networks, current code, last-updated date, `Check For Update`, and `Edit Manually`.
+  - Manual edits work offline, require `{PIN}`, and are saved locally for that network without an APK rebuild.
+
+- [x] **Android multi-SIM auto-dial:** Add a large DIAL TO RECHARGE action under PIN RESULT, disabled unless the PIN is 12–18 digits.
+  - Request `CALL_PHONE` and `READ_PHONE_STATE`; identify one active SIM automatically or show SIM 1–3 with carrier and number.
+  - Use Android TelecomManager/PhoneAccountHandle to place the USSD call through the selected SIM, encode `#` as `%23`, and save the exact PIN to masked history after dialing.
+
 - [ ] **Build handoff:** Run TypeScript checks, keep the mobile runtime configuration intact, save a Manus checkpoint, and request the managed Android APK build. Mark complete only after an actual APK artifact link is returned.

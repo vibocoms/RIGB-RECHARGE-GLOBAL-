@@ -1,0 +1,19 @@
+{
+  "MTN": {
+    "code": "*311*{PIN}#",
+    "last_updated": "2026-11-18"
+  },
+  "Airtel": {
+    "code": "*311*{PIN}#",
+    "last_updated": "2026-11-18"
+  },
+  "Glo": {
+    "code": "*311*{PIN}#",
+    "last_updated": "2026-11-18"
+  },
+  "9mobile": {
+    "code": "*311*{PIN}#",
+    "last_updated": "2026-11-18"
+  },
+  "last_updated": "2026-11-18"
+}

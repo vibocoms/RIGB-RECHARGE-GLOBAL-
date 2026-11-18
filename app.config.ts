@@ -84,7 +84,11 @@ const config: ExpoConfig = {
     },
     predictiveBackGestureEnabled: false,
     package: env.androidPackage,
-    permissions: ["POST_NOTIFICATIONS"],
+    permissions: [
+      "POST_NOTIFICATIONS",
+      "android.permission.CALL_PHONE",
+      "android.permission.READ_PHONE_STATE",
+    ],
     intentFilters: [
       {
         action: "VIEW",
@@ -114,6 +118,7 @@ const config: ExpoConfig = {
           "Allow RIGB Recharge Global to use the camera to scan recharge PINs.",
       },
     ],
+    "./plugins/with-rigb-telecom.js",
     [
       "expo-audio",
       {
