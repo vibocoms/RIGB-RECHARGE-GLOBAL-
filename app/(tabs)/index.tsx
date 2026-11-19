@@ -653,6 +653,19 @@ export default function HomeScreen() {
                 <Text style={styles.scanningText}>Reading card with OCR…</Text>
               </View>
             )}
+            <TouchableOpacity
+              onPress={handleScanAgain}
+              style={styles.scanAgainButton}
+            >
+              <MaterialCommunityIcons
+                name="camera-retake-outline"
+                size={22}
+                color={COLORS.navy}
+              />
+              <Text style={styles.scanAgainText}>
+                {scanState === "scanning" ? "SCANNING…" : "SCAN AGAIN"}
+              </Text>
+            </TouchableOpacity>
           </View>
           <Text style={styles.cameraHint}>
             Use a clear, glare-free view of the card
@@ -807,19 +820,6 @@ export default function HomeScreen() {
             <Text style={styles.controlText}>FLASH OFF</Text>
           </TouchableOpacity>
         </View>
-        <TouchableOpacity
-          onPress={handleScanAgain}
-          style={styles.scanAgainButton}
-        >
-          <MaterialCommunityIcons
-            name="camera-retake-outline"
-            size={22}
-            color={COLORS.navy}
-          />
-          <Text style={styles.scanAgainText}>
-            {scanState === "scanning" ? "SCANNING…" : "SCAN AGAIN"}
-          </Text>
-        </TouchableOpacity>
         <TouchableOpacity
           disabled={!pin.isValid}
           onPress={() => setView("confirm")}
@@ -1577,15 +1577,15 @@ const styles = StyleSheet.create({
   editButton: {
     alignItems: "center",
     backgroundColor: COLORS.gold,
-    borderRadius: 10,
+    borderRadius: 8,
     flexDirection: "row",
-    gap: 5,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
   },
   editText: {
     color: COLORS.navy,
-    fontSize: 12,
+    fontSize: 10,
     fontWeight: "900",
     letterSpacing: 0.5,
   },
@@ -1720,16 +1720,20 @@ const styles = StyleSheet.create({
   scanAgainButton: {
     alignItems: "center",
     backgroundColor: COLORS.gold,
-    borderRadius: 18,
+    borderRadius: 14,
     flexDirection: "row",
     gap: 9,
     justifyContent: "center",
-    marginTop: 15,
-    minHeight: 58,
+    minHeight: 46,
+    paddingHorizontal: 16,
+    position: "absolute",
+    bottom: 14,
+    alignSelf: "center",
+    zIndex: 3,
   },
   scanAgainText: {
     color: COLORS.navy,
-    fontSize: 20,
+    fontSize: 15,
     fontWeight: "900",
     letterSpacing: 0.6,
   },
