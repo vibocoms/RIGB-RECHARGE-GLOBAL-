@@ -44,4 +44,5 @@
   - Request `CALL_PHONE` and `READ_PHONE_STATE`; identify one active SIM automatically or show SIM 1–3 with carrier and number.
   - Use Android TelecomManager/PhoneAccountHandle to place the USSD call through the selected SIM, encode `#` as `%23`, and save the exact PIN to masked history after dialing.
 
-- [ ] **Build handoff:** Run TypeScript checks, keep the mobile runtime configuration intact, save a Manus checkpoint, and request the managed Android APK build. Mark complete only after an actual APK artifact link is returned.
+- [x] **Build handoff:** Run TypeScript checks, keep the mobile runtime configuration intact, save a Manus checkpoint, and request the managed Android APK build. Mark complete only after an actual APK artifact link is returned.
+  - Corrected GitHub Actions run `44425410386` completed successfully and produced signed APK/AAB artifacts.
